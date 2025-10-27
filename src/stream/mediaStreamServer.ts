@@ -14,6 +14,8 @@ interface SessionState {
   outboundInFlight: boolean;
   lastSpeechEndedAt?: number;
   greetingSent: boolean;
+  greetingCompleted: boolean; // ✅ Nueva flag para saber cuándo terminó el saludo
+  speechFramesCount: number; // ✅ Contador de frames con voz detectada
 }
 
 interface CreateServerOptions {
@@ -22,8 +24,9 @@ interface CreateServerOptions {
 }
 
 const DEFAULT_GENERIC_REPLY = 'Gracias por comunicarte. Estamos procesando tu solicitud.';
-const RESPONSE_DELAY_MS = 1000;
+const RESPONSE_DELAY_MS = 100;
 const SPEECH_THRESHOLD = 800;
+const MIN_SPEECH_FRAMES = 15; // ✅ Mínimo ~300ms de voz real (15 frames * 20ms)
 const ENABLE_ECHO_BACK = process.env.ECHO_BACK === 'true';
 
 export const createMediaStreamServer = ({ server, path }: CreateServerOptions): void => {
@@ -84,6 +87,8 @@ export const createMediaStreamServer = ({ server, path }: CreateServerOptions): 
             lastInboundAt: Date.now(),
             outboundInFlight: false,
             greetingSent: false,
+            greetingCompleted: false, // ✅ Inicializar en false
+            speechFramesCount: 0, // ✅ Inicializar contador
           };
           sessions.set(actualCallSid, session);
           console.log(`✅ Stream iniciado - callSid=${actualCallSid}, streamSid=${payload.start.streamSid}`);
@@ -104,37 +109,50 @@ export const createMediaStreamServer = ({ server, path }: CreateServerOptions): 
           }
           session.lastInboundAt = Date.now();
           {
-    const chunk = Buffer.from(payload.media.payload, 'base64');
-    const pcm = decodeMuLaw(chunk);
-    const volume = averageVolume(pcm);
+            const chunk = Buffer.from(payload.media.payload, 'base64');
+            const pcm = decodeMuLaw(chunk);
+            const volume = averageVolume(pcm);
 
             const isSpeech = volume > SPEECH_THRESHOLD;
 
-            if (isSpeech && !session.outboundInFlight && session.greetingSent) {
+            // ✅ SOLO detectar voz del usuario DESPUÉS de que terminó el saludo
+            if (isSpeech && !session.outboundInFlight && session.greetingCompleted) {
               if (!session.speechDetectedAt) {
                 console.log('🎤 Detección de voz inbound (volumen:', volume, ')');
                 session.speechDetectedAt = Date.now();
+                session.speechFramesCount = 0; // Reset contador
               }
+              session.speechFramesCount++; // ✅ Incrementar contador de frames con voz
               session.lastSpeechEndedAt = undefined;
               transcriber.handleAudio(pcm);
             } else if (!isSpeech && session.speechDetectedAt && !session.outboundInFlight) {
-              if (!session.lastSpeechEndedAt) {
-                console.log('🤫 Usuario dejó de hablar');
-                session.lastSpeechEndedAt = Date.now();
-              }
+              // ✅ Solo responder si hubo suficientes frames de voz real
+              if (session.speechFramesCount >= MIN_SPEECH_FRAMES) {
+                if (!session.lastSpeechEndedAt) {
+                  console.log(`🤫 Usuario dejó de hablar (${session.speechFramesCount} frames detectados)`);
+                  session.lastSpeechEndedAt = Date.now();
+                }
 
-              if (Date.now() - session.lastSpeechEndedAt > RESPONSE_DELAY_MS) {
-                console.log('🎯 Enviando respuesta tras', RESPONSE_DELAY_MS, 'ms de silencio');
-                session.outboundInFlight = true;
-                
+                if (Date.now() - session.lastSpeechEndedAt > RESPONSE_DELAY_MS) {
+                  console.log('🎯 Enviando respuesta tras', RESPONSE_DELAY_MS, 'ms de silencio');
+                  session.outboundInFlight = true;
+                  
+                  session.speechDetectedAt = undefined;
+                  session.lastSpeechEndedAt = undefined;
+                  session.speechFramesCount = 0; // Reset contador
+                  
+                  const currentSession = session;
+                  sendGenericReply(currentSession).catch((error) => {
+                    console.error('❌ Error enviando respuesta ElevenLabs', error);
+                    currentSession.outboundInFlight = false;
+                  });
+                }
+              } else {
+                // Fue ruido breve, no voz real - resetear
+                console.log(`⚠️  Ruido breve detectado (${session.speechFramesCount} frames), ignorando...`);
                 session.speechDetectedAt = undefined;
+                session.speechFramesCount = 0;
                 session.lastSpeechEndedAt = undefined;
-                
-                const currentSession = session;
-                sendGenericReply(currentSession).catch((error) => {
-                  console.error('❌ Error enviando respuesta ElevenLabs', error);
-                  currentSession.outboundInFlight = false;
-                });
               }
             }
           }
@@ -142,6 +160,11 @@ export const createMediaStreamServer = ({ server, path }: CreateServerOptions): 
 
         case 'mark':
           console.log('Marca recibida:', payload);
+          // ✅ Detectar cuando terminó el saludo
+          if (session && payload.mark?.name === 'greeting_complete') {
+            session.greetingCompleted = true;
+            console.log('✅ Saludo completado - ahora escuchando al cliente');
+          }
           break;
 
         case 'stop':
@@ -177,14 +200,13 @@ const sendGreeting = async (session: SessionState, text: string): Promise<void> 
   if (!voiceId || !apiKey) {
     console.warn('⚠️  No se puede enviar saludo - falta configuración');
     session.greetingSent = true;
+    session.greetingCompleted = true; // ✅ Marcar como completado incluso si falla
     return;
   }
 
   console.log('👋 Enviando saludo inicial...');
   console.log('   VoiceID:', voiceId.substring(0, 8) + '...');
   console.log('   Texto:', text);
-  
-  await new Promise(resolve => setTimeout(resolve, 500));
 
   let chunkNumber = 1;
 
@@ -259,8 +281,6 @@ const sendGenericReply = async (session: SessionState): Promise<void> => {
     session.outboundInFlight = false;
     return;
   }
-
-  await new Promise(resolve => setTimeout(resolve, 300));
 
   const startedAt = Date.now();
   let chunkNumber = 1;
